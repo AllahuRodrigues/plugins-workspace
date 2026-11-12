@@ -62,26 +62,50 @@ pub enum NFCTypeNameFormat {
     Unchanged = 6,
 }
 
+/// Reads a byte array sent by either platform. Android puts Kotlin's signed `Byte` values in the
+/// JSON, so bytes from `0x80` up arrive as `-128..=-1`, while iOS sends `0..=255`.
+fn deserialize_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<i16>::deserialize(deserializer)?
+        .into_iter()
+        .map(|b| match b {
+            -128..=255 => Ok(b as u8),
+            _ => Err(serde::de::Error::custom(format!("{b} is not a byte"))),
+        })
+        .collect()
+}
+
 /// An NDEF record read from a scanned tag.
 #[derive(Deserialize)]
 pub struct NfcTagRecord {
     /// The Type Name Format (TNF) of the record, which defines how [`Self::kind`] is interpreted.
     pub tnf: NFCTypeNameFormat,
     /// The record type bytes.
+    #[serde(deserialize_with = "deserialize_bytes")]
     pub kind: Vec<u8>,
     /// The record identifier bytes. Can be empty.
+    #[serde(deserialize_with = "deserialize_bytes")]
     pub id: Vec<u8>,
     /// The record payload bytes.
+    #[serde(deserialize_with = "deserialize_bytes")]
     pub payload: Vec<u8>,
 }
 
 /// An NFC tag that has been scanned.
 #[derive(Deserialize)]
 pub struct NfcTag {
-    /// The tag identifier, as reported by the operating system.
-    pub id: String,
-    /// The technology the tag supports.
-    pub kind: String,
+    /// The tag identifier bytes, as reported by the operating system.
+    ///
+    /// Empty when the platform does not report one, e.g. for FeliCa tags on iOS or when iOS only
+    /// returns the NDEF message.
+    #[serde(default, deserialize_with = "deserialize_bytes")]
+    pub id: Vec<u8>,
+    /// The technologies the tag supports, e.g. `["android.nfc.tech.Ndef"]` on Android or
+    /// `["MiFare"]` on iOS. Empty when the platform does not report them.
+    #[serde(default)]
+    pub kind: Vec<String>,
     /// The NDEF records stored on the tag. Empty when the tag holds no NDEF message.
     pub records: Vec<NfcTagRecord>,
 }
@@ -192,4 +216,57 @@ pub enum ScanKind {
         /// Only match tags whose payload URI matches this filter. **Android only**.
         uri: Option<UriFilter>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NfcTag;
+    use serde_json::json;
+
+    // `readTagInner` in NfcPlugin.kt: the id and record bytes are Kotlin `Byte`s, so they're signed.
+    #[test]
+    fn decodes_android_tag() {
+        let tag: NfcTag = serde_json::from_value(json!({
+            "id": [4, -112, 18, -1],
+            "kind": ["android.nfc.tech.NfcA", "android.nfc.tech.Ndef"],
+            "records": [{ "tnf": 1, "kind": [84], "id": [], "payload": [2, 101, 110, -61, -87] }]
+        }))
+        .unwrap();
+
+        assert_eq!(tag.id, [0x04, 0x90, 0x12, 0xff]);
+        assert_eq!(tag.kind, ["android.nfc.tech.NfcA", "android.nfc.tech.Ndef"]);
+        assert_eq!(tag.records[0].kind, b"T");
+        assert_eq!(tag.records[0].payload, b"\x02en\xc3\xa9");
+    }
+
+    // `tagMetadata` in NfcPlugin.swift.
+    #[test]
+    fn decodes_ios_tag() {
+        let tag: NfcTag = serde_json::from_value(json!({
+            "id": [4, 144, 18, 255],
+            "kind": ["MiFare"],
+            "records": [{ "tnf": 1, "kind": [85], "id": [], "payload": [4, 116, 97, 117, 114, 105] }]
+        }))
+        .unwrap();
+
+        assert_eq!(tag.id, [0x04, 0x90, 0x12, 0xff]);
+        assert_eq!(tag.kind, ["MiFare"]);
+        assert_eq!(tag.records[0].payload, b"\x04tauri");
+    }
+
+    // iOS NDEF reader sessions (`didDetectNDEFs`) only send the records, and Android leaves out
+    // `id` and `kind` when there is no tag.
+    #[test]
+    fn decodes_records_only() {
+        let tag: NfcTag = serde_json::from_value(json!({ "records": [] })).unwrap();
+
+        assert!(tag.id.is_empty());
+        assert!(tag.kind.is_empty());
+    }
+
+    #[test]
+    fn rejects_values_that_are_not_bytes() {
+        assert!(serde_json::from_value::<NfcTag>(json!({ "id": [256], "records": [] })).is_err());
+        assert!(serde_json::from_value::<NfcTag>(json!({ "id": [-129], "records": [] })).is_err());
+    }
 }
